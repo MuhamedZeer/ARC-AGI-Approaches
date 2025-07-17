@@ -319,6 +319,62 @@ def transform_custom(grid: np.ndarray) -> np.ndarray:
     best_dir = max(directions, key=lambda d: scan_and_fill(*d))
     scan_and_fill(*best_dir, paint=True)
     return g
+def connected_component_labels(grid: np.ndarray) -> np.ndarray:
+    """
+    Label connected components with unique integers.
+    Different colors get separate labels even if touching.
+    Returns labeled grid.
+    """
+    from scipy.ndimage import label
+    structure = np.ones((3,3), dtype=int)  # 8-connectivity
+    labeled, num_features = label(grid > 0, structure=structure)
+    return labeled
+
+def boundary_outline(grid: np.ndarray) -> np.ndarray:
+    """
+    Extract the boundary outline of shapes in the grid.
+    Uses morphological gradient (dilation - erosion).
+    """
+    kernel = np.ones((3,3), dtype=np.uint8)
+    dilated = cv2.dilate(grid.astype(np.uint8), kernel, iterations=1)
+    eroded = cv2.erode(grid.astype(np.uint8), kernel, iterations=1)
+    outline = dilated - eroded
+    return outline
+
+def color_cluster_simplify(grid: np.ndarray, n_clusters: int = 3) -> np.ndarray:
+    """
+    Simplify colors by clustering pixels into n_clusters based on color value.
+    Uses KMeans clustering from sklearn.
+    """
+    from sklearn.cluster import KMeans
+    pixels = grid.flatten().reshape(-1, 1)
+    nonzero_mask = pixels != 0
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+    clustered = pixels.copy()
+    clustered[nonzero_mask] = kmeans.fit_predict(pixels[nonzero_mask])
+    return clustered.reshape(grid.shape)
+
+def fill_holes(grid: np.ndarray) -> np.ndarray:
+    """
+    Fill holes inside connected components.
+    Uses binary fill holes from scipy.ndimage.
+    """
+    from scipy.ndimage import binary_fill_holes
+    mask = grid > 0
+    filled = binary_fill_holes(mask)
+    result = grid.copy()
+    result[filled & ~mask] = np.max(grid)  # fill holes with max color
+    return result
+
+def skeletonize_transform(grid: np.ndarray) -> np.ndarray:
+    """
+    Generate skeleton (thinned) representation of shapes.
+    Uses skeletonize function from skimage.
+    """
+    from skimage.morphology import skeletonize
+    binary = grid > 0
+    skeleton = skeletonize(binary).astype(np.uint8) * np.max(grid)
+    return skeleton
 
 # === Comprehensive Primitives Dictionary ===
 prims: Dict[str, Callable] = {
@@ -366,6 +422,12 @@ prims: Dict[str, Callable] = {
     'transform_31d5ba1a': transform_31d5ba1a,
     'transform_c8b7cc0f': transform_c8b7cc0f,
     'transform_custom': transform_custom,
+
+    'connected_component_labels': connected_component_labels,
+    'boundary_outline': boundary_outline,
+    'color_cluster_simplify': color_cluster_simplify,
+    'fill_holes': fill_holes,
+    'skeletonize_transform': skeletonize_transform,
 }
 
 # === Advanced Pattern Analysis ===
@@ -1047,7 +1109,7 @@ if __name__ == "__main__":
     # Set up command line arguments
     parser = argparse.ArgumentParser(description='Enhanced ARC-AGI Agent with Tree-of-Thought')
     parser.add_argument('--eval_path', type=str, 
-                       default=r"C:\Users\admin\Desktop\ARC-AGI-main\ARC-AGI-2-main\ARC-AGI-2-main\data\training",
+                       default=r"C:\Users\razan\Desktop\ARC-AGI\data\training1",
                        help='Path to evaluation data directory')
     parser.add_argument('--output', type=str, default='tot_results.json',
                        help='Output file for results')
@@ -1106,7 +1168,7 @@ if __name__ == "__main__":
         
         # Exit with appropriate code
         if results['accuracy'] > 0.5:
-            logger.info("🎉 Good performance achieved!")
+            logger.info(" Good performance achieved!")
             sys.exit(0)
         else:
             sys.exit(0)
