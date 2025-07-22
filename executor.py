@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -18,40 +18,107 @@ import torch.nn.functional as F
 # DSL & Tokeniser
 # -----------------------------------------------------------------------------
 
-class DSL:
-    """Minimal grid‑mutation DSL."""
+from types import SimpleNamespace
 
-    OPS = [
-        "PAINT",      # x, y, colour
-        "FILL",       # colour_old, colour_new
-        "MIRROR_X",   # -
-        "MIRROR_Y",   # -
-        "ROT90",      # -
-        "ROT180",     # -
-        "COPY",       # x0, y0, w, h, dx, dy
-        "STOP",       # end program
+class DSL:
+    """Minimal grid-mutation DSL with explicit arg counts."""
+
+    # ── Opcode table --------------------------------------------------------
+    # name        n_args   comments
+    OPCODES = [
+        ("PAINT"   , 3),   # x, y, colour
+        ("FILL"    , 2),   # colour_old, colour_new
+        ("MIRROR_X", 0),   # no args
+        ("MIRROR_Y", 0),   # no args
+        ("ROT90"   , 0),   # no args
+        ("ROT180"  , 0),   # no args
+        ("COPY"    , 6),   # x0, y0, w, h, dx, dy
+        ("STOP"    , 0),   # end program
     ]
 
+    # Build helper lists so we can index by token ID
+    OPS       = [name for name, _ in OPCODES]                       # ['PAINT', …]
+    N_ARGS    = [n for _, n in OPCODES]                             # [3, 2, 0, …]
+
     @classmethod
-    def op2id(cls, name: str) -> int:  # noqa: D401  (simple function)
+    def op2id(cls, name: str) -> int:
+        """Return integer ID for an opcode name."""
         return cls.OPS.index(name)
 
     @classmethod
     def id2op(cls, idx: int) -> str:
+        """Return opcode name for an integer ID."""
         return cls.OPS[idx]
+
+    @classmethod
+    def nargs(cls, idx: int) -> int:
+        """Number of arguments that opcode *idx* expects."""
+        return cls.N_ARGS[idx]
+
+
 
 
 class ProgramTokenizer(nn.Module):
-    """Embeds DSL op‑codes + integer args."""
+    """
+    Lightweight token-to-vector embedder for program tokens.
 
-    def __init__(self, d_model: int, vocab_extra: int = 256):
+    * `vocab_size` can be passed explicitly (recommended) — otherwise it defaults
+      to `len(DSL.OPS) + 1`, which was the original size (all DSL opcodes + STOP).
+    * `d_model` is the embedding dimension shared with the rest of the network.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        vocab_size: Optional[int] = None,
+        pad_id: Optional[int] = None,
+    ):
         super().__init__()
-        self.tok_stop = DSL.op2id("STOP")
-        self.vocab_size = len(DSL.OPS) + vocab_extra
-        self.emb = nn.Embedding(self.vocab_size, d_model)
 
-    def forward(self, toks: torch.LongTensor) -> torch.Tensor:  # [B, T]
-        return self.emb(toks)
+        if vocab_size is None:
+            vocab_size = len(DSL.OPS) + 1          # original: opcodes + STOP
+
+        self.vocab_size = vocab_size
+        self.pad_id = pad_id if pad_id is not None else 0
+
+        self.emb = nn.Embedding(self.vocab_size, d_model, padding_idx=self.pad_id)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def forward(self, tok_ids: torch.LongTensor) -> torch.Tensor:
+        """
+        Args
+        ----
+        tok_ids : LongTensor of shape [B, T]
+
+        Returns
+        -------
+        Tensor of shape [B, T, d_model]
+        """
+        return self.emb(tok_ids)
+
+    # ------------------------------------------------------------------
+    # Optional: grow the vocabulary after initialisation
+    # ------------------------------------------------------------------
+    def expand_vocab(self, extra_tokens: int = 1):
+        """
+        Increase the embedding matrix by `extra_tokens` rows.
+        Useful if you decide to add new opcodes or special tokens late.
+
+        NOTE: Call *before* you load any pretrained weights that depend on
+        the original embedding size.
+        """
+        if extra_tokens <= 0:
+            return  # nothing to do
+
+        with torch.no_grad():
+            old_weight = self.emb.weight.data
+            B, d = old_weight.shape
+            new_rows = torch.randn(extra_tokens, d, device=old_weight.device) * 0.02
+            new_weight = torch.cat([old_weight, new_rows], dim=0)
+            self.emb = nn.Embedding.from_pretrained(new_weight, padding_idx=self.pad_id)
+            self.vocab_size += extra_tokens
 
 
 # -----------------------------------------------------------------------------
@@ -59,28 +126,81 @@ class ProgramTokenizer(nn.Module):
 # -----------------------------------------------------------------------------
 
 class ProgramSynthesiser(nn.Module):
-    def __init__(self, d_model: int, max_steps: int = 10, n_heads: int = 8):
+    """
+    Takes a task embedding + a sequence of previous tokens and returns logits
+    for the next token.  Uses a 2-layer Transformer decoder.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        max_steps: int = 10,
+        n_heads: int = 8,
+        vocab_size: Optional[int] = None,
+    ):
+        """
+        Args
+        ----
+        d_model     : hidden size
+        max_steps   : maximum program length we’ll sample
+        n_heads     : transformer heads
+        vocab_size  : total number of token IDs (defaults to len(DSL)+1)
+                      We pass `len(DSL.OPS) + 2` so we have room for NOOP + STOP.
+        """
         super().__init__()
-        self.token_emb = ProgramTokenizer(d_model)
+
+        if vocab_size is None:
+            vocab_size = len(DSL.OPS) + 1                # original behaviour
+
+        # --- Token embedding -------------------------------------------------
+        self.token_emb = ProgramTokenizer(d_model, vocab_size=vocab_size)
+        self.vocab_size = vocab_size                     # save for reference
+
+        # --- 2-layer Transformer decoder -------------------------------------
         decoder_layer = nn.TransformerDecoderLayer(d_model, n_heads)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
-        self.mem_proj = nn.Linear(d_model, d_model)  # task embedding → memory key
-        self.lm_head = nn.Linear(d_model, self.token_emb.vocab_size)
+
+        # --- Project task embedding into decoder “memory” --------------------
+        self.mem_proj = nn.Linear(d_model, d_model)
+
+        # --- Language-model head ---------------------------------------------
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
         self.max_steps = max_steps
 
-        self.register_buffer("start_tok", torch.tensor([DSL.op2id("STOP")]))  # start symbol
+        # Use STOP as the BOS token (simplest): [STOP] means “start decoding”
+        self.register_buffer(
+            "start_tok",
+            torch.tensor([DSL.op2id("STOP")], dtype=torch.long)
+        )
 
-    def forward(self, task_emb: torch.Tensor, prev_toks: torch.LongTensor) -> torch.Tensor:
-        # task_emb: [B, d]  prev_toks: [B, T]
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        task_emb: torch.Tensor,          # shape [B, d]
+        prev_toks: torch.LongTensor,     # shape [B, T]
+    ) -> torch.Tensor:                   # returns logits [B, vocab_size]
         B = task_emb.size(0)
+
+        # If no previous tokens, feed the BOS (= STOP) token
         if prev_toks.numel() == 0:
-            prev_toks = self.start_tok.expand(B, 1)
-        tok_emb = self.token_emb(prev_toks)  # [B, T, d]
-        tgt = tok_emb.transpose(0, 1)  # [T, B, d]
-        mem = self.mem_proj(task_emb).unsqueeze(0)  # [1, B, d]
-        out = self.decoder(tgt, mem)
-        logits = self.lm_head(out[-1])  # last token
-        return logits  # [B, V]
+            prev_toks = self.start_tok.to(task_emb.device).expand(B, 1)
+
+        # --- Embed tokens & project task memory -----------------------------
+        tok_emb = self.token_emb(prev_toks)          # [B, T, d]
+        tgt     = tok_emb.transpose(0, 1)            # [T, B, d]
+
+        mem     = self.mem_proj(task_emb).unsqueeze(0)  # [1, B, d]
+
+        # --- Transformer decoding -------------------------------------------
+        out = self.decoder(tgt, mem)                 # [T, B, d]
+
+        # Return logits for the last generated position
+        logits = self.lm_head(out[-1])               # [B, vocab_size]
+        return logits
+
 
 
 # -----------------------------------------------------------------------------
@@ -143,14 +263,34 @@ class GridSandbox:
 class Executor(nn.Module):
     """Generates a program then executes it on an input grid."""
 
+    # ------------------------------------------------------------------
+    # Token IDs (keep them consistent everywhere)
+    # ------------------------------------------------------------------
+    tok_noop: int = 0                                 # new: identity op
+    tok_stop: int = len(DSL.OPS) + 1                  # stop / EOS token
+
     def __init__(self, d_model: int = 128, max_steps: int = 10):
         super().__init__()
-        self.synth = ProgramSynthesiser(d_model, max_steps=max_steps)
-        self.tokenizer = self.synth.token_emb  # convenience
-        self._have_encoder = False  # flag after attach
+
+        #  We need one extra vocab slot for NOOP
+        vocab_size = len(DSL.OPS) + 2                 # +1 STOP, +1 NOOP
+
+        self.synth = ProgramSynthesiser(
+            d_model,
+            max_steps=max_steps,
+            vocab_size=vocab_size,                    # <-- enlarged
+        )
+        self.tokenizer = self.synth.token_emb     # <-- define this first
+
+
+        self.tokenizer.tok_noop = self.tok_noop  # alias: 0
+        self.tokenizer.tok_stop = self.tok_stop  # alias: len(DSL.OPS)+1
+
+        self._have_encoder = False
+
 
     # ------------------------------------------------------------------
-    # Plumbing to attach encoder/synthesiser (used by SearchLoop)
+    # Plumbing to attach encoder / synthesiser (used by SearchLoop)
     # ------------------------------------------------------------------
     def attach_encoder(self, grid_encoder, task_synthesiser):
         """Attach external encoder + task synthesiser so *meta_encode* works."""
@@ -159,58 +299,89 @@ class Executor(nn.Module):
         self._have_encoder = True
 
     # ------------------------------------------------------------------
-    # Meta‑encoding helpers
+    # Meta-encoding helpers
     # ------------------------------------------------------------------
-    def meta_encode(self, grids_in: List[torch.Tensor], grids_out: List[torch.Tensor]) -> torch.Tensor:
+    def meta_encode(
+        self,
+        grids_in: List[torch.Tensor],
+        grids_out: List[torch.Tensor],
+    ) -> torch.Tensor:
         if not self._have_encoder:
             raise RuntimeError("Executor: call attach_encoder() first.")
-        batch = grids_in + grids_out  # list of 6 tensors
+
+        batch = grids_in + grids_out                 # list of 6 tensors
         roles = torch.tensor([0] * len(grids_in) + [1] * len(grids_out))
-        enc = self.grid_encoder
-        synth = self.task_synthesiser
+
         with torch.no_grad():
-            grid_vecs = enc(batch)  # (6, d)
-            task_emb = synth(grid_vecs, roles)  # (d,)
+            grid_vecs = self.grid_encoder(batch)     # (6, d)
+            task_emb  = self.task_synthesiser(grid_vecs, roles)  # (d,)
+
         return task_emb
 
     # ------------------------------------------------------------------
-    # Sampling & execution
+    # Sampling
     # ------------------------------------------------------------------
-    def sample_step(self, task_emb: torch.Tensor, prev_toks: List[int], temperature: float = 1.0) -> torch.Tensor:
+    def sample_step(
+        self,
+        task_emb: torch.Tensor,
+        prev_toks: List[int],
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Return logits over the *full* vocabulary (including NOOP + STOP)."""
         prev = torch.tensor(prev_toks, dtype=torch.long).unsqueeze(0)  # [1, T]
-        logits = self.synth(task_emb, prev)  # [1, V]
+        logits = self.synth(task_emb, prev)                            # [1, V]
         if temperature != 1.0:
             logits = logits / temperature
-        return logits.squeeze(0)  # [V]
+        return logits.squeeze(0)                                       # [V]
 
-    def run_program(self, program: List[int], grid: torch.LongTensor) -> torch.LongTensor:
+    # ------------------------------------------------------------------
+    # Program execution
+    # ------------------------------------------------------------------
+    def run_program(
+        self,
+        program: List[int],
+        grid: torch.LongTensor,
+    ) -> torch.LongTensor:
         """
-        Execute a flat token list on a copy of *grid*.
+        Execute *program* on a clone of *grid*.
 
-        Tokens are read in chunks of four: [opcode, arg1, arg2, arg3].
-        • Execution stops if we hit the explicit STOP token **or**
-          if the opcode ID is outside the valid DSL range (guard-rail).
-        • Missing arguments are padded with zeros.
+        • Identity if program is [], [STOP], or [NOOP].
+        • Each opcode knows how many arguments it needs: DSL.OPS[tok].n_args.
+        • We slice exactly that many from the token stream and pad with zeros
+          if the list runs short.
         """
+        # ── Identity shortcuts ─────────────────────────────────────────────
+        if (
+            len(program) == 0
+            or program == [self.tok_stop]
+            or program == [self.tok_noop]
+        ):
+            return grid.clone()
+
         g = grid.clone()
         i = 0
         while i < len(program):
             tok = program[i]
 
-            # ── Halt on STOP or invalid opcode ────────────────────────────────
-            if tok == self.tokenizer.tok_stop or tok >= len(DSL.OPS):
+            # ── Halt on STOP / NOOP / invalid opcode ───────────────────────
+            if tok in (self.tok_stop, self.tok_noop) or tok >= len(DSL.OPS):
                 break
 
-            # ── Fetch up to three arguments, pad if fewer are present ────────
-            args = program[i + 1 : i + 4]
-            args = args + [0] * (3 - len(args))
+            # ── How many args does this opcode need? -----------------------
+            try:
+                n_args = DSL.nargs(tok)  # returns 0, 2, or 6 for this opcode
+            except AttributeError:
+                # Fallback: assume 0-arg op if metadata missing
+                n_args = 0
+
+            # ── Slice exactly that many, pad with zeros if fewer present ───
+            args = program[i + 1 : i + 1 + n_args]
+            args = args + [0] * (n_args - len(args))
 
             g = GridSandbox.step(g, tok, args)
-            i += 4  # advance to next opcode slot
+            i += 1 + n_args                              # advance pointer
 
         return g
-
-
 
 
 # -----------------------------------------------------------------------------
