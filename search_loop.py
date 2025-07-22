@@ -54,13 +54,13 @@ class Example:
 # -----------------------------------------------------------------------------
 
 
-def grid_score(pred: torch.LongTensor, target: torch.LongTensor) -> float:
-    """Pixel‑wise accuracy (0 = perfect, 1 = completely wrong)."""
+def grid_score(pred: torch.LongTensor, target: torch.LongTensor) -> torch.Tensor:
+    """Pixel-wise error (0 = perfect match, 1 = completely wrong).
+    Returns a *scalar tensor* so gradients can flow."""
     if pred.shape != target.shape:
-        return 1.0  # maximal error if sizes disagree
-    total = target.numel()
-    wrong = (pred != target).float().sum().item()
-    return wrong / total
+        return torch.ones((), device=pred.device)      # max error
+    return (pred != target).float().mean()             # scalar tensor
+
 
 
 # -----------------------------------------------------------------------------
@@ -69,11 +69,9 @@ def grid_score(pred: torch.LongTensor, target: torch.LongTensor) -> float:
 
 
 class BeamSearcher:
-    """Simple breadth‑wise search over generated programs.
+    """Breadth-wise search over generated programs.
 
-    At each depth we keep the *beam_width* best partial programs (lowest loss).
-    The Executor exposes *sample_step* which produces the next token(s)
-    conditioned on the previous ones, so we can explore multiple branches.
+    We keep the `beam_width` best partial programs at each depth.
     """
 
     def __init__(
@@ -83,59 +81,88 @@ class BeamSearcher:
         max_depth: int = 8,
         temperature: float = 1.0,
     ) -> None:
-        self.executor = executor
-        self.beam_width = beam_width
-        self.max_depth = max_depth
+        self.executor    = executor
+        self.beam_width  = beam_width
+        self.max_depth   = max_depth
         self.temperature = temperature
 
-    @torch.no_grad()
+    # ------------------------------------------------------------------
+    # Main search
+    # ------------------------------------------------------------------
     def search(
         self,
         examples: Sequence[Example],
         test_grid: torch.LongTensor,
         device: torch.device | str = "cpu",
-    ) -> Tuple[List[int], torch.LongTensor, float]:
-        """Run beam search – returns (best_program_tokens, best_grid, score)."""
+    ) -> Tuple[List[int], torch.LongTensor, torch.Tensor]:
+        """Beam-search; returns (tokens, predicted_grid, error_tensor)."""
+
         self.executor.to(device)
         test_grid = test_grid.to(device)
 
-        # Pre‑compute the task embedding once – no need to redo at each beam step
-        grids_in = [ex.x for ex in examples]
+        grids_in  = [ex.x for ex in examples]
         grids_out = [ex.y for ex in examples]
-        me = self.executor.meta_encode(grids_in, grids_out)  # shape [1, d]
+        me        = self.executor.meta_encode(grids_in, grids_out)
 
-        # Each beam item: (program_tokens[List[int]], grid, score)
-        BeamItem = Tuple[List[int], torch.LongTensor, float]
-        beams: List[BeamItem] = [([], test_grid, 1.0)]
+        # ------------------------------------------------------------------
+        # 1. Seed the beam with the identity program  (copy-input)
+        # ------------------------------------------------------------------
+        id_prog  = [self.executor.tok_noop]           # single-token NOOP
+        with torch.no_grad():
+            errs = [
+                grid_score(
+                    self.executor.run_program(id_prog, x.clone()), y
+                )
+                for x, y in zip(grids_in, grids_out)
+            ]
+        id_score = torch.stack(errs).mean()           # scalar tensor (0 ≤ s ≤ 1)
+        id_grid  = self.executor.run_program(id_prog, test_grid.clone())
+
+        BeamItem = Tuple[List[int], torch.LongTensor, torch.Tensor]
+        beams: List[BeamItem] = [(id_prog, id_grid, id_score)]
         best: BeamItem | None = None
 
+        # ------------------------------------------------------------------
+        # 2. Expand the beam depth-by-depth
+        # ------------------------------------------------------------------
         for depth in range(self.max_depth):
             candidates: List[BeamItem] = []
+
             for prog_tokens, grid_state, _ in beams:
-                logits = self.executor.sample_step(me, prog_tokens, temperature=self.temperature)
-                # Sample top‑k tokens (includes STOP)
-                topk = torch.topk(logits, self.beam_width).indices.tolist()
-                for tok in topk:
+                logits = self.executor.sample_step(
+                    me, prog_tokens, temperature=self.temperature
+                )
+                for tok in torch.topk(logits, self.beam_width).indices.tolist():
                     new_prog = prog_tokens + [tok]
-                    # Execute only when STOP or last depth – else defer to save compute
-                    if tok == self.executor.tokenizer.tok_stop or depth == self.max_depth - 1:
-                        new_grid = self.executor.run_program(new_prog, grid_state.clone())
-                        s = grid_score(new_grid, grids_out[0])  # score vs first example output
+
+                    # ── If program is finished, score it on *all* examples ──
+                    if tok == self.executor.tok_stop or depth == self.max_depth - 1:
+                        errs = [
+                            grid_score(
+                                self.executor.run_program(new_prog, x.clone()), y
+                            )
+                            for x, y in zip(grids_in, grids_out)
+                        ]
+                        s = torch.stack(errs).mean()          # scalar tensor
+                        new_grid = self.executor.run_program(
+                            new_prog, test_grid.clone()
+                        )
                         candidates.append((new_prog, new_grid, s))
                     else:
-                        # For non‑terminal partial program we carry forward same grid (no op yet)
-                        candidates.append((new_prog, grid_state, 1.0))
+                        # Partial program: keep current grid_state, max error
+                        candidates.append(
+                            (new_prog, grid_state, torch.ones((), device=device))
+                        )
 
-            # Keep lowest *beam_width* by score
-            beams = sorted(candidates, key=lambda t: t[2])[: self.beam_width]
-            best = beams[0]
-            # Early exit if perfect match
-            if best[2] == 0.0:
+            # Keep lowest-error `beam_width` candidates
+            beams = sorted(candidates, key=lambda t: t[2].item())[: self.beam_width]
+            best  = beams[0]
+
+            if best[2].item() == 0.0:     # perfect match → early exit
                 break
 
-        assert best is not None, "Beam search produced no result!?"
-        return best  # (program_tokens, grid, score)
-
+        assert best is not None
+        return best       # (program_tokens, predicted_grid, pixel_error)
 
 # -----------------------------------------------------------------------------
 # Glue class – SearchLoop
@@ -166,7 +193,7 @@ class SearchLoop(nn.Module):
         # flow end‑to‑end (useful during training)
         self.executor.attach_encoder(self.encoder, self.synthesiser)
 
-    @torch.no_grad()
+
     def solve_examples(
         self,
         examples: Sequence[Example],
@@ -204,7 +231,6 @@ class ARCSearchRunner(SearchLoop):
     ) -> None:
         super().__init__(encoder, synthesiser, executor, beam_width, max_depth)
 
-    @torch.no_grad()
     def solve(
         self,
         ex_grids: Sequence[torch.LongTensor],
