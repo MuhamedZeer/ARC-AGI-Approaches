@@ -59,13 +59,15 @@ def load_arc_json(path: Path) -> Dict:
 def build_solver(ckpt_path: Path | None = None, device: str = "cpu") -> ARCSearchRunner:
     """Instantiate the *inference‑only* pipeline and load weights if provided."""
 
-    grid_encoder, task_synth = default_pixel_vit(num_colours=256)
+    grid_encoder, task_synth = default_pixel_vit(num_colours=10)
     executor = Executor(grid_encoder.cfg.emb_dim)
     solver = ARCSearchRunner(grid_encoder, task_synth, executor).to(device)
 
     if ckpt_path is not None:
         state = torch.load(ckpt_path, map_location=device)
+
         missing, unexpected = solver.load_state_dict(state, strict=False)
+
         if missing:
             print("[Eval] Warning: missing keys:", missing)
         if unexpected:
@@ -104,12 +106,19 @@ def evaluate_task(
     start_t = time.perf_counter()
     for sample in test_pairs:
         inp_grid = torch.tensor(sample["input"], dtype=torch.long, device=device)
-        best_prog, pred_grid, score = solver.solve(
-            ex_grids, roles_t, inp_grid, beam_width=beam_width
-        )
-        # Score = pixel error; exact match if 0
-        exact = score == 0
-        preds.append((pred_grid.cpu().tolist(), exact, score))
+        best_prog, pred_grid, _ = solver.solve(ex_grids, roles_t, inp_grid, beam_width=beam_width)
+
+        gt_grid = torch.tensor(sample["output"], dtype=torch.long, device=device)
+
+        # handle shape mismatch
+        if pred_grid.shape != gt_grid.shape:
+            pix_err = 1.0
+        else:
+            pix_err = (pred_grid != gt_grid).float().mean().item()
+
+        exact = pix_err == 0.0
+        preds.append((pred_grid.cpu().tolist(), exact, pix_err))
+
     dt = time.perf_counter() - start_t
 
     # Aggregate metrics (multiple test inputs uncommon but spec‑compliant)
