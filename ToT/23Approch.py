@@ -1,6 +1,7 @@
 # Enhanced ARC Agent with Advanced Tree-of-Thought (ToT) and Meta-Programming
 # Integrated with comprehensive transformation functions from Functions.py
 # Features: Dynamic beam width, tree pruning, loop detection, advanced CNN embeddings
+# Added: PDF Report Generation with visual predictions
 
 import os, json, numpy as np
 from typing import List, Callable, Dict, Any, Tuple, Optional, Set
@@ -16,8 +17,23 @@ from scipy.ndimage import convolve
 from joblib import Parallel, delayed
 import argparse
 import time
-import sys
+import logging
 
+# Configure and define the logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+import sys
+from pathlib import Path
+
+# PDF Generation imports
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    from matplotlib.colors import ListedColormap
+    MATPLOTLIB_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Matplotlib not available: {e}")
+    MATPLOTLIB_AVAILABLE = False
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +41,32 @@ logger = logging.getLogger(__name__)
 
 layers = keras.layers
 models = keras.models
+
+# === PDF Visualization Components ===
+# Colour palette + colormap (10‑colour ARC scheme) – RGB in 0‑1 range
+_PALETTE = np.array(
+    [
+        (0, 0, 0),         # 0 – black
+        (0, 0, 1),         # 1 – blue
+        (1, 0, 0),         # 2 – red
+        (0, 1, 0),         # 3 – green
+        (1, 1, 0),         # 4 – yellow
+        (0.5, 0.5, 0.5),   # 5 – gray
+        (1, 0, 1),         # 6 – magenta
+        (1, 0.65, 0),      # 7 – orange
+        (0, 1, 1),         # 8 – cyan
+        (1, 1, 1),         # 9 – white
+    ],
+    dtype=np.float32,
+)
+
+_CMAP = ListedColormap(_PALETTE)
+
+def _add_grid(ax, grid: np.ndarray, title: str):
+    """Add grid visualization to matplotlib axis"""
+    ax.imshow(grid, cmap=_CMAP, vmin=0, vmax=9)
+    ax.set_title(title, fontsize=7)
+    ax.axis("off")
 
 # === Enhanced Data Structures ===
 @dataclass
@@ -320,6 +362,7 @@ def transform_custom(grid: np.ndarray) -> np.ndarray:
     best_dir = max(directions, key=lambda d: scan_and_fill(*d))
     scan_and_fill(*best_dir, paint=True)
     return g
+
 def connected_component_labels(grid: np.ndarray) -> np.ndarray:
     """
     Label connected components with unique integers.
@@ -536,20 +579,40 @@ def build_advanced_cnn(input_shape=(30, 30, 1), feat_dim=256):
     
     return model
 
-# Initialize advanced CNN
-advanced_cnn = build_advanced_cnn()
+# Initialize advanced CNN (lazy initialization to avoid import issues)
+advanced_cnn = None
+
+def get_advanced_cnn():
+    """Lazy initialization of CNN to avoid import issues"""
+    global advanced_cnn
+    if advanced_cnn is None:
+        try:
+            advanced_cnn = build_advanced_cnn()
+        except Exception as e:
+            logger.warning(f"Failed to initialize CNN: {e}")
+            return None
+    return advanced_cnn
 
 def extract_advanced_features(grid: np.ndarray) -> np.ndarray:
     """Extract advanced features using multi-scale CNN"""
-    H, W = grid.shape
-    pad = np.zeros((30, 30), dtype=grid.dtype)
-    pad[:min(H, 30), :min(W, 30)] = grid[:min(H, 30), :min(W, 30)]
+    cnn = get_advanced_cnn()
+    if cnn is None:
+        # Fallback to simple features if CNN fails
+        return extract_handcrafted_features(grid)
     
-    # Normalize
-    pad_norm = pad.astype(np.float32) / 10.0
-    
-    pred = advanced_cnn(pad_norm.reshape(1, 30, 30, 1))
-    return pred.numpy().flatten()
+    try:
+        H, W = grid.shape
+        pad = np.zeros((30, 30), dtype=grid.dtype)
+        pad[:min(H, 30), :min(W, 30)] = grid[:min(H, 30), :min(W, 30)]
+        
+        # Normalize
+        pad_norm = pad.astype(np.float32) / 10.0
+        
+        pred = cnn(pad_norm.reshape(1, 30, 30, 1))
+        return pred.numpy().flatten()
+    except Exception as e:
+        logger.warning(f"CNN feature extraction failed: {e}")
+        return extract_handcrafted_features(grid)
 
 def extract_handcrafted_features(grid: np.ndarray) -> np.ndarray:
     """Extract handcrafted features for additional context"""
@@ -991,6 +1054,145 @@ class ToTArcAgent:
         # Last resort: return input
         return test_input.copy()
 
+# === PDF Report Generation Functions ===
+def save_pdf_report(report_items: List[Dict], out_path: Path):
+    """Create a multi‑page PDF visualising context + prediction vs ground truth."""
+    if not MATPLOTLIB_AVAILABLE:
+        logger.error("Matplotlib not available. Cannot generate PDF report.")
+        return
+    
+    if not report_items:
+        logger.warning("No report items to save to PDF")
+        return
+    
+    logger.info(f"Generating PDF with {len(report_items)} report items...")
+    
+    with PdfPages(out_path) as pdf:
+        for i, item in enumerate(report_items):
+            try:
+                n_train = len(item["train_inputs"])
+                ncols = max(2 * n_train, 3)  # 2 per example (in+out) vs 3 for final row
+                fig, axes = plt.subplots(2, ncols, figsize=(1.5 * ncols, 3), dpi=150)
+                axes = axes.reshape(2, ncols)  # make sure we always have 2 × ncols
+
+                # --- Row 0: every (input→output) training pair ------------------
+                for k in range(n_train):
+                    _add_grid(axes[0, 2 * k], item["train_inputs"][k], f"Train In {k}")
+                    _add_grid(axes[0, 2 * k + 1], item["train_outputs"][k], f"Train Out {k}")
+
+                # Hide any unused axes on row 0
+                for col in range(2 * n_train, ncols):
+                    axes[0, col].axis("off")
+
+                # --- Row 1: Test input | Prediction | Ground truth -------------
+                _add_grid(axes[1, 0], item["test_input"], "Test Input")
+                _add_grid(axes[1, 1], item["pred"], "Prediction")
+                _add_grid(axes[1, 2], item["gt"], "Ground Truth")
+
+                # Hide any remaining axes on row 1
+                for col in range(3, ncols):
+                    axes[1, col].axis("off")
+
+                suptitle = (
+                    f"{item['task_id']} – sample {item['sample_idx']} | "
+                    f"exact={item['exact']} | pix_err={item['pixel_error']:.3f}"
+                )
+                fig.suptitle(suptitle, fontsize=9)
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+                
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Generated {i + 1}/{len(report_items)} PDF pages")
+                    
+            except Exception as e:
+                logger.error(f"Error generating PDF page {i}: {e}")
+                continue
+    
+    logger.info(f"PDF report successfully saved to: {out_path}")
+
+def generate_report_data(tasks: List[Dict[str, Any]], agent: ToTArcAgent) -> List[Dict]:
+    """Generate report data for PDF visualization"""
+    report_items = []
+    
+    logger.info(f"Generating report data for {len(tasks)} tasks...")
+    
+    for i, task in enumerate(tasks):
+        try:
+            # Create mock problem object for compatibility
+            class MockProblem:
+                def __init__(self, task_data):
+                    self.task_data = task_data
+                    self._name = task_data.get('filename', 'unknown')
+                
+                def problem_name(self):
+                    return self._name
+                
+                def training_set(self):
+                    return [MockArcSet(p) for p in self.task_data['train']]
+                
+                def test_set(self):
+                    return MockArcSet(self.task_data['test'][0])
+            
+            class MockArcSet:
+                def __init__(self, data):
+                    self.data = data
+                
+                def get_input_data(self):
+                    return MockData(np.array(self.data['input']))
+                
+                def get_output_data(self):
+                    return MockData(np.array(self.data['output']))
+            
+            class MockData:
+                def __init__(self, array):
+                    self.array = array
+                
+                def data(self):
+                    return self.array
+            
+            problem = MockProblem(task)
+            
+            # Get prediction
+            predictions = agent.make_predictions(problem)
+            prediction = predictions[0]
+            
+            # Get ground truth
+            test_output = np.array(task['test'][0]['output'])
+            
+            # Calculate error
+            if prediction.shape != test_output.shape:
+                pix_err = 1.0
+            else:
+                pix_err = (prediction != test_output).astype(float).mean()
+            exact = pix_err == 0.0
+            
+            # Prepare training data
+            train_inputs_np = [np.array(p["input"], dtype=np.int16) for p in task['train']]
+            train_outputs_np = [np.array(p["output"], dtype=np.int16) for p in task['train']]
+            
+            report_items.append({
+                "task_id": task.get('filename', 'unknown').replace('.json', ''),
+                "sample_idx": 0,
+                "train_inputs": train_inputs_np,
+                "train_outputs": train_outputs_np,
+                "test_input": np.array(task['test'][0]['input']),
+                "pred": prediction,
+                "gt": test_output,
+                "exact": exact,
+                "pixel_error": pix_err,
+            })
+            
+            if (i + 1) % 10 == 0:
+                logger.info(f"Generated report data for {i + 1}/{len(tasks)} tasks")
+            
+        except Exception as e:
+            logger.error(f"Error generating report data for task {task.get('filename', 'unknown')}: {e}")
+            continue
+    
+    logger.info(f"Successfully generated report data for {len(report_items)} tasks")
+    return report_items
+
 # === Task Loading (Enhanced) ===
 def load_tasks_from_dir(path: str) -> List[Dict[str, Any]]:
     """Enhanced task loading with error handling"""
@@ -1069,14 +1271,17 @@ def solve_task_enhanced(task: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         return False, {'error': str(e)}
 
 # === Enhanced Runner ===
-def evaluate_all_enhanced(eval_dir: str) -> Dict[str, Any]:
-    """Enhanced evaluation with detailed reporting"""
+def evaluate_all_enhanced(eval_dir: str, generate_pdf: bool = False, pdf_path: str = None) -> Dict[str, Any]:
+    """Enhanced evaluation with detailed reporting and optional PDF generation"""
     tasks = load_tasks_from_dir(eval_dir)
     total = len(tasks)
     correct = 0
     results = []
     
     logger.info(f"Evaluating {total} tasks from {eval_dir}")
+    
+    # Initialize agent for PDF generation if needed
+    agent = ToTArcAgent() if generate_pdf else None
     
     for i, task in enumerate(tasks):
         logger.info(f"Processing task {i+1}/{total}: {task.get('filename', 'unknown')}")
@@ -1094,6 +1299,16 @@ def evaluate_all_enhanced(eval_dir: str) -> Dict[str, Any]:
     
     final_accuracy = correct / total if total > 0 else 0.0
     
+    # Generate PDF report if requested
+    if generate_pdf and pdf_path and agent:
+        logger.info("Generating PDF report...")
+        try:
+            report_data = generate_report_data(tasks, agent)
+            save_pdf_report(report_data, Path(pdf_path))
+            logger.info(f"PDF report saved to: {pdf_path}")
+        except Exception as e:
+            logger.error(f"Failed to generate PDF report: {e}")
+    
     summary = {
         'total_tasks': total,
         'correct_tasks': correct,
@@ -1108,12 +1323,14 @@ def evaluate_all_enhanced(eval_dir: str) -> Dict[str, Any]:
 # === Main Execution ===
 if __name__ == "__main__":
     # Set up command line arguments
-    parser = argparse.ArgumentParser(description='Enhanced ARC-AGI Agent with Tree-of-Thought')
+    parser = argparse.ArgumentParser(description='Enhanced ARC-AGI Agent with Tree-of-Thought and PDF Reports')
     parser.add_argument('--eval_path', type=str, 
-                       default=r"C:\Users\razan\Desktop\ARC-AGI\data\training1",
+                       default=r"C:\Users\admin\Desktop\ARC-AGI-main\ARC-AGI-2-main\ARC-AGI-2-main\data\evaluation",
                        help='Path to evaluation data directory')
     parser.add_argument('--output', type=str, default='tot_results.json',
                        help='Output file for results')
+    parser.add_argument('--pdf_report', type=str, default='results.pdf',
+                       help='Path to save PDF visualization report (optional)')
     parser.add_argument('--max_tasks', type=int, default=None,
                        help='Maximum number of tasks to evaluate (for testing)')
     args = parser.parse_args()
@@ -1131,10 +1348,12 @@ if __name__ == "__main__":
             sys.exit(1)
         
         logger.info("=" * 60)
-        logger.info("Enhanced ARC-AGI Agent with Tree-of-Thought")
+        logger.info("Enhanced ARC-AGI Agent with Tree-of-Thought and PDF Reports")
         logger.info("=" * 60)
         logger.info(f"Evaluation path: {args.eval_path}")
         logger.info(f"Output file: {args.output}")
+        if args.pdf_report:
+            logger.info(f"PDF report: {args.pdf_report}")
         if args.max_tasks:
             logger.info(f"Max tasks to evaluate: {args.max_tasks}")
         logger.info("=" * 60)
@@ -1144,7 +1363,18 @@ if __name__ == "__main__":
         
         # Run evaluation
         logger.info("Starting enhanced ARC-AGI evaluation with Tree-of-Thought...")
-        results = evaluate_all_enhanced(args.eval_path)
+        
+        # Ensure PDF path is properly set
+        generate_pdf = bool(args.pdf_report)
+        if generate_pdf and not args.pdf_report:
+            logger.warning("PDF report requested but no path provided. Disabling PDF generation.")
+            generate_pdf = False
+        
+        results = evaluate_all_enhanced(
+            args.eval_path, 
+            generate_pdf=generate_pdf,
+            pdf_path=args.pdf_report
+        )
         
         # Calculate timing
         elapsed_time = time.time() - start_time
@@ -1165,11 +1395,13 @@ if __name__ == "__main__":
         if results['total_tasks'] > 0:
             logger.info(f"Average time per task: {elapsed_time/results['total_tasks']:.2f} seconds")
         logger.info(f"Results saved to: {args.output}")
+        if args.pdf_report:
+            logger.info(f"PDF report saved to: {args.pdf_report}")
         logger.info("=" * 60)
         
         # Exit with appropriate code
         if results['accuracy'] > 0.5:
-            logger.info(" Good performance achieved!")
+            logger.info("✅ Good performance achieved!")
             sys.exit(0)
         else:
             sys.exit(0)
